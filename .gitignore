@@ -1,0 +1,39 @@
+# Environment
+.env
+*.env
+
+# Secrets
+user_keys.csv
+*.pem
+*.key
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Docker volumes (local data)
+postgres_data/
+redis_data/
+qdrant_data/
+
+# Models (too large for git)
+/models/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/

@@ -1,0 +1,69 @@
+# ──────────────────────────────────────────────
+# LiteLLM Proxy Config — Routes OpenAI-compatible
+# requests to internal vLLM instances
+# ──────────────────────────────────────────────
+
+model_list:
+  # ── Primary Chat Model: Llama 3.1 405B MXFP4 (GPUs 0-5) ──
+  - model_name: "gpt-4"
+    litellm_params:
+      model: "openai/amd/Llama-3.1-405B-Instruct-MXFP4"
+      api_base: "http://localhost:8000/v1"
+      api_key: "vllm-internal-key"
+      rpm: 600
+      tpm: 5000000
+      stream: true
+
+  # Alias: also respond to gpt-4-turbo, gpt-4o requests
+  - model_name: "gpt-4-turbo"
+    litellm_params:
+      model: "openai/amd/Llama-3.1-405B-Instruct-MXFP4"
+      api_base: "http://localhost:8000/v1"
+      api_key: "vllm-internal-key"
+      rpm: 600
+
+  - model_name: "gpt-4o"
+    litellm_params:
+      model: "openai/amd/Llama-3.1-405B-Instruct-MXFP4"
+      api_base: "http://localhost:8000/v1"
+      api_key: "vllm-internal-key"
+      rpm: 600
+
+  # ── Code Model: Qwen 2.5 Coder 32B FP8 (GPU 6) ──
+  - model_name: "gpt-3.5-turbo"
+    litellm_params:
+      model: "openai/Qwen/Qwen2.5-Coder-32B-Instruct"
+      api_base: "http://localhost:8001/v1"
+      api_key: "vllm-internal-key"
+      rpm: 400
+      tpm: 2000000
+
+  # ── Embedding Model: BGE-large (GPU 7) ──
+  - model_name: "text-embedding-ada-002"
+    litellm_params:
+      model: "openai/BAAI/bge-large-en-v1.5"
+      api_base: "http://localhost:8002/v1"
+      api_key: "vllm-internal-key"
+      rpm: 1000
+
+  - model_name: "text-embedding-3-small"
+    litellm_params:
+      model: "openai/BAAI/bge-large-en-v1.5"
+      api_base: "http://localhost:8002/v1"
+      api_key: "vllm-internal-key"
+      rpm: 1000
+
+litellm_settings:
+  drop_params: true
+  set_verbose: false
+  num_retries: 3
+  request_timeout: 120
+  telemetry: false
+
+general_settings:
+  master_key: "sk-litellm-master-change-me"
+  database_url: "postgresql://llm_admin:change-me@localhost:5432/llm_platform"
+  alerting: ["slack"]
+  # Uncomment and set your Slack webhook for alerts
+  # alerting_args:
+  #   slack_webhook_url: "https://hooks.slack.com/services/..."
