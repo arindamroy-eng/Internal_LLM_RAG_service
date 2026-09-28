@@ -8,7 +8,7 @@ model_list:
   - model_name: "gpt-4"
     litellm_params:
       model: "openai/amd/Llama-3.1-405B-Instruct-MXFP4"
-      api_base: "http://localhost:8000/v1"
+      api_base: "http://host.docker.internal:8000/v1"
       api_key: "vllm-internal-key"
       rpm: 600
       tpm: 5000000
@@ -18,14 +18,14 @@ model_list:
   - model_name: "gpt-4-turbo"
     litellm_params:
       model: "openai/amd/Llama-3.1-405B-Instruct-MXFP4"
-      api_base: "http://localhost:8000/v1"
+      api_base: "http://host.docker.internal:8000/v1"
       api_key: "vllm-internal-key"
       rpm: 600
 
   - model_name: "gpt-4o"
     litellm_params:
       model: "openai/amd/Llama-3.1-405B-Instruct-MXFP4"
-      api_base: "http://localhost:8000/v1"
+      api_base: "http://host.docker.internal:8000/v1"
       api_key: "vllm-internal-key"
       rpm: 600
 
@@ -33,7 +33,7 @@ model_list:
   - model_name: "gpt-3.5-turbo"
     litellm_params:
       model: "openai/Qwen/Qwen2.5-Coder-32B-Instruct"
-      api_base: "http://localhost:8001/v1"
+      api_base: "http://host.docker.internal:8001/v1"
       api_key: "vllm-internal-key"
       rpm: 400
       tpm: 2000000
@@ -42,27 +42,34 @@ model_list:
   - model_name: "text-embedding-ada-002"
     litellm_params:
       model: "openai/BAAI/bge-large-en-v1.5"
-      api_base: "http://localhost:8002/v1"
+      api_base: "http://host.docker.internal:8002/v1"
       api_key: "vllm-internal-key"
       rpm: 1000
 
   - model_name: "text-embedding-3-small"
     litellm_params:
       model: "openai/BAAI/bge-large-en-v1.5"
-      api_base: "http://localhost:8002/v1"
+      api_base: "http://host.docker.internal:8002/v1"
       api_key: "vllm-internal-key"
       rpm: 1000
 
 litellm_settings:
   drop_params: true
   set_verbose: false
-  num_retries: 3
+  # Retries are owned HERE, not in the SDK. app/services/llm_client.py sets
+  # max_retries=0 so the two layers cannot multiply. A retried chat request
+  # re-enters the llm-d endpoint picker and may land on a different replica,
+  # which guarantees a cold prefix — so keep this low.
+  num_retries: 1
   request_timeout: 120
   telemetry: false
 
 general_settings:
   master_key: "sk-litellm-master-change-me"
-  database_url: "postgresql://llm_admin:change-me@localhost:5432/llm_platform"
+  # DB connection comes from the DATABASE_URL env var injected by
+  # docker-compose.yml, which is the single source of truth for credentials.
+  # (A hardcoded DSN here previously pointed at `localhost` with a different
+  # password than compose used.)
   alerting: ["slack"]
   # Uncomment and set your Slack webhook for alerts
   # alerting_args:

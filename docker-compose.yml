@@ -13,7 +13,13 @@ services:
       - "${POSTGRES_PORT:-5432}:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
-      - ./app/db/migrations/001_initial.sql:/docker-entrypoint-initdb.d/001_initial.sql
+      # Whole directory, not a single file: entrypoint scripts run in
+      # lexical order, so 001_initial.sql then 002_message_seq.sql.
+      # NOTE: these run only on an EMPTY data volume. An existing deployment
+      # must apply 002_message_seq.sql by hand:
+      #   docker compose exec -T postgres psql -U llm_admin -d llm_platform \
+      #     < app/db/migrations/002_message_seq.sql
+      - ./app/db/migrations:/docker-entrypoint-initdb.d:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-llm_admin}"]
       interval: 5s
@@ -44,7 +50,7 @@ services:
 
   # ── Qdrant Vector DB ──
   qdrant:
-    image: qdrant/qdrant:latest
+    image: qdrant/qdrant:v1.12.5
     container_name: llm-qdrant
     ports:
       - "${QDRANT_PORT:-6333}:6333"
@@ -81,12 +87,24 @@ services:
       --config /app/config.yaml
       --port 4000
       --num_workers 8
+    # vLLM runs with --network=host (see scripts/start_vllm.sh), so it is NOT
+    # reachable from this bridge network by service name or by "localhost".
+    # This maps host.docker.internal to the docker0 gateway so the api_base
+    # values in litellm_config.yaml resolve to the host's published ports.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     environment:
       LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY:-sk-litellm-master-change-me}
       DATABASE_URL: postgresql://${POSTGRES_USER:-llm_admin}:${POSTGRES_PASSWORD:-change-me}@postgres:5432/${POSTGRES_DB:-llm_platform}
     depends_on:
       postgres:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:4000/health/liveliness', timeout=3).status==200 else 1)\""]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
     restart: unless-stopped
 
   # ── Application API ──
@@ -112,7 +130,121 @@ services:
       qdrant:
         condition: service_healthy
       litellm:
-        condition: service_started
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+
+  # ──────────────────────────────────────────────
+  # llm-d router: Endpoint Picker (EPP) + Envoy
+  #
+  # Routes among the THREE 405B chat replicas started by
+  # scripts/start_vllm_sharded.sh. Not started by default — bring them up
+  # only after GATE A and GATE B in the plan:
+  #     docker compose up -d epp envoy
+  #
+  # Both run with network_mode: host. That is what lets Envoy reach the EPP
+  # on 127.0.0.1:9002 and lets the EPP scrape vLLM /metrics on the host
+  # loopback. On the bridge network the endpoint addresses would have to be
+  # the host's LAN IP, because the file-discovery plugin does not resolve
+  # hostnames. Note host mode makes depends_on/Compose DNS inert for these
+  # two services.
+  # ──────────────────────────────────────────────
+  epp:
+    # Pinned deliberately: the upstream env.sh defaults this to :main, which
+    # would let scheduling behaviour change under you between restarts.
+    # v0.9.0 chosen because llmd/epp/config.yaml was verified byte-identical
+    # between the llm-d guide at main and at v0.9.0. Newer router images
+    # exist (v0.10.0, v0.11.0) and are versioned independently of llm-d/llm-d
+    # releases — if you bump this, re-check the dataLayer.discovery schema
+    # note in llmd/epp/config.yaml first.
+    image: ghcr.io/llm-d/llm-d-router-endpoint-picker:v0.9.0
+    container_name: llm-d-epp
+    profiles: ["llmd"]
+    network_mode: host
+    volumes:
+      - ./llmd/epp:/etc/epp:ro
+    command:
+      - --config-file=/etc/epp/config.yaml
+      # Not Kubernetes references in file-discovery mode; they only label
+      # metrics and logs.
+      - --pool-name=file-discovery
+      - --pool-namespace=default
+      - --grpc-port=9002
+      - --grpc-health-port=9003
+      - --metrics-port=9090
+      - --secure-serving=false
+      - --v=2
+      # KNOWN UPSTREAM ISSUE (llm-d#2567): llmd/envoy/envoy.yaml configures a
+      # grpc_health_check against this process, but the EPP only registers
+      # the gRPC health service when health checking is enabled — and the
+      # upstream guide's own command does not enable it. Envoy then marks the
+      # EPP permanently unhealthy and reaches it only via PANIC ROUTING,
+      # which still works with a single EPP, which is why it goes unnoticed.
+      #
+      # Verify on first run:
+      #     curl -s localhost:19000/clusters | grep ext_proc
+      # If it does not report health_flags::healthy, add:
+      #     - --health-checking=true
+      # (flag name unverified against this image — check `--help` first).
+    restart: unless-stopped
+
+  envoy:
+    image: docker.io/envoyproxy/envoy:distroless-v1.33.2
+    container_name: llm-d-envoy
+    profiles: ["llmd"]
+    network_mode: host
+    volumes:
+      - ./llmd/envoy/envoy.yaml:/etc/envoy/envoy.yaml:ro
+    command:
+      - --service-node=envoy-proxy
+      - --log-level=warn
+      - --concurrency=8
+      - --drain-strategy=immediate
+      - --drain-time-s=60
+      - -c
+      - /etc/envoy/envoy.yaml
+    depends_on:
+      - epp
+    restart: unless-stopped
+
+  # ── Prometheus ──
+  # Published on 9091: port 9090 on the host is reserved for the llm-d
+  # endpoint picker's metrics endpoint (Phase 4).
+  prometheus:
+    image: prom/prometheus:v3.1.0
+    container_name: llm-prometheus
+    ports:
+      - "${PROMETHEUS_PORT:-9091}:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=30d
+    # Needed to scrape vLLM, which runs on the host network.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+
+  # ── Grafana ──
+  grafana:
+    image: grafana/grafana:11.5.0
+    container_name: llm-grafana
+    ports:
+      - "${GRAFANA_PORT:-3000}:3000"
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-change-me}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - grafana_data:/var/lib/grafana
+    depends_on:
+      - prometheus
     restart: unless-stopped
 
   # ── Nginx Reverse Proxy (optional) ──
@@ -124,9 +256,15 @@ services:
       - "443:443"
     volumes:
       - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - nginx_logs:/var/log/nginx
+    # Must be service_healthy, not a bare list: nginx resolves the names in
+    # its `upstream` blocks at startup and refuses to boot if they are not
+    # resolvable yet.
     depends_on:
-      - app
-      - litellm
+      app:
+        condition: service_healthy
+      litellm:
+        condition: service_healthy
     restart: unless-stopped
 
 volumes:
@@ -134,3 +272,6 @@ volumes:
   redis_data:
   qdrant_data:
   qdrant_snapshots:
+  prometheus_data:
+  grafana_data:
+  nginx_logs:

@@ -1,0 +1,60 @@
+# ──────────────────────────────────────────────
+# Scrape config for the LLM serving tier.
+#
+# vLLM runs with --network=host, so it is reached via the docker0 gateway
+# (host.docker.internal), not by Compose service name.
+#
+# NOTE: vLLM's --api-key middleware only guards the /v1, /v2, /inference and
+# /cohere prefixes. /metrics and /health are exempt, so no bearer token is
+# needed here.
+# ──────────────────────────────────────────────
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  # ── Chat pool: 3x Llama 3.1 405B MXFP4, TP=2 ──
+  # Until scripts/start_vllm_sharded.sh is running, only :8000 will be UP.
+  # That is expected during Phase 0/1.
+  - job_name: vllm-chat
+    metrics_path: /metrics
+    static_configs:
+      - targets:
+          - "host.docker.internal:8000"
+          - "host.docker.internal:8010"
+          - "host.docker.internal:8020"
+        labels:
+          pool: chat
+          model: llama-3.1-405b-mxfp4
+
+  - job_name: vllm-code
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["host.docker.internal:8001"]
+        labels:
+          pool: code
+          model: qwen2.5-coder-32b
+
+  - job_name: vllm-embed
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["host.docker.internal:8002"]
+        labels:
+          pool: embed
+          model: bge-large-en-v1.5
+
+  - job_name: litellm
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["litellm:4000"]
+
+  # ── llm-d endpoint picker (Phase 4) ──
+  # Target is DOWN until the epp service is started; that is expected.
+  - job_name: llm-d-epp
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["host.docker.internal:9090"]
+
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]

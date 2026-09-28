@@ -1,0 +1,75 @@
+# ──────────────────────────────────────────────
+# llm-d Endpoint Picker (EPP) configuration.
+#
+# Taken from the upstream no-Kubernetes guide
+# (guides/no-kubernetes-deployment/router/epp/config.yaml), with only the
+# endpoints path unchanged and commentary added. Keep it close to upstream:
+# this config is read ONCE at startup, and the schema is still moving (see
+# the note on dataLayer.discovery below).
+#
+# Scope reminder: this picks among replicas of ONE model. Choosing WHICH
+# model serves a request stays in LiteLLM.
+# ──────────────────────────────────────────────
+apiVersion: llm-d.ai/v1alpha1
+kind: EndpointPickerConfig
+
+plugins:
+  # Endpoint inventory from a file rather than a Kubernetes InferencePool.
+  # This is what lets llm-d run without a cluster.
+  - name: file-discovery
+    type: file-discovery
+    parameters:
+      path: /etc/epp/endpoints.yaml
+      watchFile: true
+
+  # Scorers. Each returns a score per candidate endpoint; the weighted sum in
+  # schedulingProfiles decides the winner.
+  - type: queue-scorer                  # prefers shorter vLLM queues
+  - type: kv-cache-utilization-scorer   # avoids replicas near KV exhaustion
+  - type: prefix-cache-scorer           # THE reason llm-d is here: send a
+                                        # request to the replica that already
+                                        # holds its prompt prefix
+  - type: no-hit-lru-scorer             # spreads requests that hit nothing
+
+  - name: metrics-source
+    type: metrics-data-source
+  - name: metrics-extractor
+    type: core-metrics-extractor
+
+schedulingProfiles:
+  - name: default
+    plugins:
+      # Upstream default weights, biased toward cache affinity (3 vs 2).
+      #
+      # TUNING: that bias assumes substantial prefix sharing. If the measured
+      # prefix-cache hit rate is weak (GATE A lands in the 0.25-0.40 band),
+      # flatten these toward 1:1:1:1 — with weak sharing the affinity term
+      # mostly just imbalances load, and queue-scorer is the safety valve.
+      # These weights are the first thing to sweep at GATE C.
+      - pluginRef: queue-scorer
+        weight: 2
+      - pluginRef: kv-cache-utilization-scorer
+        weight: 2
+      - pluginRef: prefix-cache-scorer
+        weight: 3
+      - pluginRef: no-hit-lru-scorer
+        weight: 2
+
+dataLayer:
+  injectDefaults: false
+  discovery:
+    # SCHEMA DRIFT — verify against the pinned image on first run.
+    # This flat form matches the current upstream guide. The Go API docs mark
+    # it deprecated in favour of the nested
+    #     discovery:
+    #       endpoints:
+    #         pluginRef: file-discovery
+    # with automatic migration. Do not switch pre-emptively: an image that
+    # predates the nested form will reject it. Instead grep the EPP startup
+    # log for a deprecation warning, and migrate when it appears:
+    #     docker logs llm-d-epp 2>&1 | grep -i deprecat
+    pluginRef: file-discovery
+  sources:
+    - pluginRef: metrics-source
+      extractors:
+        - pluginRef: metrics-extractor

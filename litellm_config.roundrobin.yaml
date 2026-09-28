@@ -1,0 +1,130 @@
+# ──────────────────────────────────────────────
+# LiteLLM Proxy Config — CONTROL ARM / FALLBACK
+#
+# Load-balances the three 405B replicas directly, with NO llm-d in the path.
+#
+# Two jobs:
+#   1. The CONTROL for GATE C. llm-d must beat this by >=20% on p95 TTFT at
+#      equal throughput (or >=20% throughput at equal p95) to justify its
+#      containers and extra hop. Plain least-busy balancing is free; the only
+#      thing llm-d adds over it is prefix affinity.
+#   2. The fast ROLLBACK. To bypass llm-d entirely:
+#        cp litellm_config.roundrobin.yaml litellm_config.yaml
+#        docker compose restart litellm
+#
+# The mechanism: LiteLLM load-balances across model_list entries that SHARE a
+# model_name. In the default config every model_name is unique, which makes
+# its router pure pass-through. Here the three chat replicas deliberately
+# share "gpt-4".
+# ──────────────────────────────────────────────
+
+model_list:
+  # ── Chat pool: 3x Llama 3.1 405B MXFP4, TP=2 (GPUs 0-5) ──
+  # Same model_name on purpose — this is what enables balancing.
+  - model_name: "gpt-4"
+    litellm_params:
+      model: "openai/amd/Llama-3.1-405B-Instruct-MXFP4"
+      api_base: "http://host.docker.internal:8000/v1"
+      api_key: "vllm-internal-key"
+      rpm: 600
+      tpm: 5000000
+      stream: true
+
+  - model_name: "gpt-4"
+    litellm_params:
+      model: "openai/amd/Llama-3.1-405B-Instruct-MXFP4"
+      api_base: "http://host.docker.internal:8010/v1"
+      api_key: "vllm-internal-key"
+      rpm: 600
+      tpm: 5000000
+      stream: true
+
+  - model_name: "gpt-4"
+    litellm_params:
+      model: "openai/amd/Llama-3.1-405B-Instruct-MXFP4"
+      api_base: "http://host.docker.internal:8020/v1"
+      api_key: "vllm-internal-key"
+      rpm: 600
+      tpm: 5000000
+      stream: true
+
+  # ── Aliases onto the same pool ──
+  - model_name: "gpt-4-turbo"
+    litellm_params:
+      model: "openai/amd/Llama-3.1-405B-Instruct-MXFP4"
+      api_base: "http://host.docker.internal:8000/v1"
+      api_key: "vllm-internal-key"
+      rpm: 600
+  - model_name: "gpt-4-turbo"
+    litellm_params:
+      model: "openai/amd/Llama-3.1-405B-Instruct-MXFP4"
+      api_base: "http://host.docker.internal:8010/v1"
+      api_key: "vllm-internal-key"
+      rpm: 600
+  - model_name: "gpt-4-turbo"
+    litellm_params:
+      model: "openai/amd/Llama-3.1-405B-Instruct-MXFP4"
+      api_base: "http://host.docker.internal:8020/v1"
+      api_key: "vllm-internal-key"
+      rpm: 600
+
+  - model_name: "gpt-4o"
+    litellm_params:
+      model: "openai/amd/Llama-3.1-405B-Instruct-MXFP4"
+      api_base: "http://host.docker.internal:8000/v1"
+      api_key: "vllm-internal-key"
+      rpm: 600
+  - model_name: "gpt-4o"
+    litellm_params:
+      model: "openai/amd/Llama-3.1-405B-Instruct-MXFP4"
+      api_base: "http://host.docker.internal:8010/v1"
+      api_key: "vllm-internal-key"
+      rpm: 600
+  - model_name: "gpt-4o"
+    litellm_params:
+      model: "openai/amd/Llama-3.1-405B-Instruct-MXFP4"
+      api_base: "http://host.docker.internal:8020/v1"
+      api_key: "vllm-internal-key"
+      rpm: 600
+
+  # ── Code Model: Qwen 2.5 Coder 32B FP8 (GPU 6) — single replica ──
+  - model_name: "gpt-3.5-turbo"
+    litellm_params:
+      model: "openai/Qwen/Qwen2.5-Coder-32B-Instruct"
+      api_base: "http://host.docker.internal:8001/v1"
+      api_key: "vllm-internal-key"
+      rpm: 400
+      tpm: 2000000
+
+  # ── Embedding Model: BGE-large (GPU 7) — single replica ──
+  - model_name: "text-embedding-ada-002"
+    litellm_params:
+      model: "openai/BAAI/bge-large-en-v1.5"
+      api_base: "http://host.docker.internal:8002/v1"
+      api_key: "vllm-internal-key"
+      rpm: 1000
+
+  - model_name: "text-embedding-3-small"
+    litellm_params:
+      model: "openai/BAAI/bge-large-en-v1.5"
+      api_base: "http://host.docker.internal:8002/v1"
+      api_key: "vllm-internal-key"
+      rpm: 1000
+
+router_settings:
+  # least-busy approximates what llm-d's queue-scorer does, WITHOUT the
+  # prefix affinity. That is exactly the delta GATE C is measuring.
+  # Verify the key name against your LiteLLM build — it has moved between
+  # litellm_settings and router_settings across versions.
+  routing_strategy: least-busy
+
+litellm_settings:
+  drop_params: true
+  set_verbose: false
+  num_retries: 1
+  request_timeout: 120
+  telemetry: false
+
+general_settings:
+  master_key: "sk-litellm-master-change-me"
+  alerting: ["slack"]

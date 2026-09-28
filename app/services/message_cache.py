@@ -33,6 +33,9 @@ class MessageCache:
     def _summary_key(self, conversation_id: str) -> str:
         return f"convo:{conversation_id}:summary"
 
+    def _window_key(self, conversation_id: str) -> str:
+        return f"convo:{conversation_id}:window_start"
+
     async def append_message(self, conversation_id: str, message: dict):
         """Add a message to the conversation cache."""
         key = self._key(conversation_id)
@@ -70,11 +73,38 @@ class MessageCache:
             summary,
         )
 
+    async def get_window_start(self, conversation_id: str) -> Optional[int]:
+        """
+        Get the anchor (message seq) the history window starts at.
+
+        Returns None if no anchor has been set, meaning 'include all cached
+        history'. See ContextManager._select_history_window.
+        """
+        raw = await self.redis.get(self._window_key(conversation_id))
+        return int(raw) if raw is not None else None
+
+    async def set_window_start(self, conversation_id: str, seq: int):
+        """
+        Advance the history window anchor.
+
+        Monotonic by construction: the value is only ever written when it is
+        greater than the current one, and the Lua-free guard below keeps that
+        true even if two turns of the same conversation race. Moving the
+        anchor backwards would re-expand the window and invalidate the prompt
+        prefix from position zero.
+        """
+        key = self._window_key(conversation_id)
+        current = await self.redis.get(key)
+        if current is not None and int(current) >= seq:
+            return
+        await self.redis.set(key, seq, ex=settings.redis_message_ttl)
+
     async def invalidate(self, conversation_id: str):
         """Clear cache for a conversation."""
         pipe = self.redis.pipeline()
         pipe.delete(self._key(conversation_id))
         pipe.delete(self._summary_key(conversation_id))
+        pipe.delete(self._window_key(conversation_id))
         await pipe.execute()
 
 

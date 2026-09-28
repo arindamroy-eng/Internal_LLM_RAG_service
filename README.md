@@ -21,17 +21,41 @@ Users (OpenAI-compatible SDK)
                         ┌───────────┘
                         ▼
                ┌────────────────┐
-               │   LiteLLM      │  :4000
-               │   Proxy        │
+               │   LiteLLM      │  :4000   ← decides WHICH MODEL
+               │   Proxy        │            (aliases, keys, budgets)
                └───────┬────────┘
                        │
-           ┌───────────┼───────────┐
-           ▼           ▼           ▼
-        vLLM        vLLM        vLLM
-        405B        Coder       Embed
-        :8000       :8001       :8002
-        GPU 0-5     GPU 6       GPU 7
+        ┌──────────────┼──────────────┐
+        ▼              ▼              ▼
+ ┌─────────────┐    vLLM           vLLM
+ │ llm-d Envoy │    Coder          Embed
+ │    :8081    │    :8001          :8002
+ │      │      │    GPU 6          GPU 7
+ │   EPP:9002  │  ← decides WHICH REPLICA
+ └──────┬──────┘    (prefix-cache + load aware)
+        │
+  ┌─────┼─────┐
+  ▼     ▼     ▼
+ vLLM  vLLM  vLLM        405B MXFP4, TP=2 each
+ :8000 :8010 :8020       GPUs 0,1 / 2,3 / 4,5
 ```
+
+### Two layers of routing
+
+The split matters, because they are different problems:
+
+| Layer | Question | Owner |
+|---|---|---|
+| Model selection | *Which model serves this request?* | LiteLLM alias, from `agents.model` |
+| Replica selection | *Which replica of that model?* | llm-d Endpoint Picker |
+
+**llm-d does not route between different models.** It picks among replicas of
+one model, using prefix-cache locality and queue/KV pressure. There is no
+"send code questions to the coder model" capability in llm-d — that decision
+stays where it already was.
+
+llm-d is optional and gated. Bring it up only after measuring; see
+`docs/` and the gates below.
 
 ## Hardware Requirements
 
@@ -167,11 +191,104 @@ response = client.chat.completions.create(
 
 ## GPU Allocation
 
-| GPUs | Model | Precision | Purpose | Port |
-|------|-------|-----------|---------|------|
-| 0-5 | Llama 3.1 405B | MXFP4 | Primary chat/reasoning | 8000 |
-| 6 | Qwen 2.5 Coder 32B | FP8 | Code generation | 8001 |
-| 7 | BGE-large-en-v1.5 | FP16 | Embeddings for RAG | 8002 |
+Production layout — `scripts/start_vllm_sharded.sh`:
+
+| GPUs | Model | Precision | TP | Purpose | Port |
+|------|-------|-----------|----|---------|------|
+| 0,1 | Llama 3.1 405B | MXFP4 | 2 | Chat replica 0 | 8000 |
+| 2,3 | Llama 3.1 405B | MXFP4 | 2 | Chat replica 1 | 8010 |
+| 4,5 | Llama 3.1 405B | MXFP4 | 2 | Chat replica 2 | 8020 |
+| 6 | Qwen 2.5 Coder 32B | FP8 | 1 | Code generation | 8001 |
+| 7 | BGE-large-en-v1.5 | FP16 | 1 | Embeddings for RAG | 8002 |
+
+Single-replica fallback — `scripts/start_vllm.sh`: 405B at TP=4 on GPUs 0-3,
+GPUs 4-5 idle.
+
+> **Tensor-parallel size is constrained.** Llama 3.1 405B has 128 attention
+> heads, **8 KV heads** and `intermediate_size` 53248. vLLM requires TP to
+> divide all three, so only **TP ∈ {2, 4, 8}** are valid. An earlier config
+> used TP=6, which fails on two of the three — that server could not start.
+
+> **Replication is not free.** Three copies of the weights (~223 GB each)
+> cost roughly 34% of aggregate KV capacity versus one large shard, and
+> per-token decode for a *single* request is ~3× slower at TP=2 than at TP=6
+> because each GPU streams a larger shard per token. This layout wins on
+> aggregate throughput under concurrency and loses at low concurrency.
+> Measure before adopting it.
+
+## Enabling llm-d replica routing
+
+llm-d is **off by default** (Compose profile `llmd`). It is worth installing
+only if requests actually share prompt prefixes — its documented benefit on
+low-prefix-sharing traffic is approximately zero.
+
+### Prerequisites
+
+1. **A replica pool.** `./scripts/start_vllm_sharded.sh` — with one replica
+   there is nothing to pick between.
+2. **A reusable prefix.** The context builder places the volatile RAG block
+   *after* conversation history precisely so a stable prefix exists. Verify
+   with `pytest tests/test_context_prefix_stability.py`.
+
+### Gates
+
+Do not skip these; each one can end the project cheaply.
+
+| Gate | Check | If it fails |
+|---|---|---|
+| **A** | Chat prefix-cache hit rate ≥ 0.25 under a real multi-turn replay | Stop. llm-d has nothing to route on. |
+| **B** | Does `litellm_config.roundrobin.yaml` already meet the SLO? | Stop. Plain least-busy balancing is free. |
+| **C** | llm-d beats round-robin by ≥20% p95 TTFT at equal throughput | Roll back to round-robin. |
+
+Measure with a replay of **real conversations**, not synthetic prompts —
+random prompts have zero prefix sharing by construction and will pre-decide
+Gate A against llm-d.
+
+### Start
+
+```bash
+./scripts/start_vllm_sharded.sh          # 3 chat replicas
+docker compose --profile llmd up -d      # epp + envoy
+curl -s localhost:19000/clusters | grep ext_proc   # expect health_flags::healthy
+```
+
+Then point the chat aliases at Envoy in `litellm_config.yaml`
+(`api_base: http://host.docker.internal:8081/v1`) and restart LiteLLM.
+
+### Rollback
+
+```bash
+cp litellm_config.roundrobin.yaml litellm_config.yaml   # bypass llm-d  (~10s)
+docker compose restart litellm
+docker compose --profile llmd down                      # remove llm-d   (~5s)
+./scripts/start_vllm.sh                                 # single replica (~15min)
+```
+
+To drain one replica without restarting the EPP, remove its entry from
+`llmd/epp/endpoints.yaml` by **atomic rename** (`mv tmp endpoints.yaml`);
+`watchFile: true` reloads it live.
+
+## Observability
+
+Prometheus on `:9091`, Grafana on `:3000`. Key metrics for the gates:
+
+| Signal | Metric |
+|---|---|
+| Prefix cache hit rate | `vllm:prefix_cache_hits_total / vllm:prefix_cache_queries_total` |
+| Queue depth | `vllm:num_requests_waiting` |
+| TTFT | `vllm:time_to_first_token_seconds` |
+| KV pressure | `vllm:gpu_cache_usage_perc` |
+| **Preemption thrash** | `vllm:num_preemptions_total` |
+
+Check metric names against your image first — vLLM V0 exposed a
+`vllm:gpu_prefix_cache_hit_rate` gauge where V1 uses counters:
+
+```bash
+curl -s localhost:8000/metrics | grep -i prefix
+```
+
+End-to-end TTFT (including context assembly and the LiteLLM/Envoy hops, which
+vLLM cannot see) is logged by the app as `ttft_seconds=`.
 
 ## Configuration
 
@@ -206,14 +323,25 @@ Internal_LLM_RAG_service/
 │       └── chat.py             # Chat endpoint with streaming
 ├── scripts/
 │   ├── setup_rocm.sh           # ROCm + driver installation
-│   ├── start_vllm.sh           # Launch vLLM instances on GPUs
+│   ├── start_vllm.sh           # Single-replica fallback (405B TP=4)
+│   ├── start_vllm_sharded.sh   # Production: 3x 405B TP=2 chat pool
 │   └── create_user_keys.sh     # User + API key provisioning
+├── llmd/                       # llm-d replica router (Compose profile: llmd)
+│   ├── epp/config.yaml         # Endpoint Picker: scorers + weights
+│   ├── epp/endpoints.yaml      # Chat replica inventory (hot-reloadable)
+│   └── envoy/envoy.yaml        # ext_proc proxy in front of the EPP
+├── monitoring/
+│   └── prometheus.yml          # Scrape config for vLLM / LiteLLM / EPP
+├── tests/
+│   └── test_context_prefix_stability.py  # Prefix-reuse invariants
 ├── nginx/
 │   └── nginx.conf              # Reverse proxy config
 ├── docker-compose.yml          # Full stack orchestration
-├── litellm_config.yaml         # LiteLLM proxy routing config
+├── litellm_config.yaml         # LiteLLM routing (model selection)
+├── litellm_config.roundrobin.yaml  # llm-d-free control arm / rollback
 ├── Dockerfile                  # App container image
 ├── requirements.txt            # Python dependencies
+├── requirements-dev.txt        # + test dependencies
 ├── .env.example                # Environment template
 └── README.md
 ```
