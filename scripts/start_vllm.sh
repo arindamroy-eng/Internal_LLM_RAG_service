@@ -1,8 +1,13 @@
 #!/usr/bin/env bash
 # ──────────────────────────────────────────────
-# Launch vLLM instances on 8× MI350X GPUs
+# Launch vLLM instances on 8× MI350X GPUs — SINGLE-REPLICA FALLBACK
 #
-# GPU 0-5: Llama 3.1 405B MXFP4 (chat/reasoning)
+# For the production 3-replica chat pool, use start_vllm_sharded.sh instead.
+# This script exists so there is always a known-good single-replica state to
+# roll back to.
+#
+# GPU 0-3: Llama 3.1 405B MXFP4 (chat/reasoning), TP=4
+# GPU 4-5: unused in this layout
 # GPU 6:   Qwen 2.5 Coder 32B FP8 (code gen)
 # GPU 7:   BGE-large-en-v1.5 (embeddings for RAG)
 # ──────────────────────────────────────────────
@@ -52,18 +57,27 @@ sleep 2
 
 # ──────────────────────────────────────────────
 # Instance 1: Chat Model — Llama 3.1 405B MXFP4
-# GPUs 0-5, Tensor Parallel = 6
+# GPUs 0-3, Tensor Parallel = 4
+#
+# NOTE: this was previously TP=6 on GPUs 0-5, which cannot work. Llama 3.1
+# 405B has 128 attention heads, 8 KV heads and intermediate_size 53248, and
+# vLLM requires the tensor-parallel size to divide all three: 8 % 6 = 2 and
+# 53248 % 6 = 4 both fail, so the server exited at startup. Only TP ∈ {2,4,8}
+# are valid for this model. GPUs 4-5 are left free here.
+#
+# This script is now the SINGLE-REPLICA FALLBACK. The production path is
+# scripts/start_vllm_sharded.sh (3x TP=2). Keep both working.
 # ──────────────────────────────────────────────
 echo ""
-echo "[1/3] Starting Chat Model (Llama 3.1 405B MXFP4) on GPUs 0-5..."
+echo "[1/3] Starting Chat Model (Llama 3.1 405B MXFP4) on GPUs 0-3..."
 docker run -d \
     --name vllm-chat \
     "${COMMON_FLAGS[@]}" \
-    -e ROCR_VISIBLE_DEVICES=0,1,2,3,4,5 \
+    -e ROCR_VISIBLE_DEVICES=0,1,2,3 \
     "${VLLM_IMAGE}" \
     vllm serve "${VLLM_CHAT_MODEL:-amd/Llama-3.1-405B-Instruct-MXFP4}" \
         --dtype auto \
-        --tensor-parallel-size 6 \
+        --tensor-parallel-size 4 \
         --port 8000 \
         --api-key "${VLLM_API_KEY}" \
         --max-model-len 32768 \

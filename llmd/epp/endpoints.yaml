@@ -1,0 +1,45 @@
+# ──────────────────────────────────────────────
+# Endpoint inventory for the llm-d file-discovery plugin.
+#
+# This is the CHAT POOL ONLY: three replicas of the SAME model. llm-d picks
+# among replicas of one model — it does not route between different models.
+# The code model (:8001) and embedding model (:8002) are therefore absent by
+# design; LiteLLM addresses those directly.
+#
+# Addresses must be literal IPv4 — the plugin does not resolve hostnames.
+# 127.0.0.1 is correct here only because the EPP container runs with
+# network_mode: host, sharing the host netns with the vLLM containers
+# (which use --network=host). If the EPP is ever moved onto the Compose
+# bridge, these must become the host's LAN IP.
+#
+# The `model` label must match what LiteLLM puts on the wire. LiteLLM strips
+# the "openai/" provider prefix from litellm_config.yaml, so the wire value
+# is the bare HuggingFace repo id below.
+#
+# HOT RELOAD: config.yaml sets watchFile: true, so edits are picked up
+# without restarting the EPP — but only on an ATOMIC rewrite. To drain a
+# replica:
+#     cp endpoints.yaml endpoints.yaml.tmp
+#     $EDITOR endpoints.yaml.tmp        # remove the entry
+#     mv endpoints.yaml.tmp endpoints.yaml
+#     docker logs llm-d-epp | tail      # confirm the reload
+# Editing in place is less reliable (partial reads).
+# ──────────────────────────────────────────────
+endpoints:
+  - name: vllm-chat-0
+    address: 127.0.0.1
+    port: "8000"
+    labels:
+      model: amd/Llama-3.1-405B-Instruct-MXFP4
+
+  - name: vllm-chat-1
+    address: 127.0.0.1
+    port: "8010"
+    labels:
+      model: amd/Llama-3.1-405B-Instruct-MXFP4
+
+  - name: vllm-chat-2
+    address: 127.0.0.1
+    port: "8020"
+    labels:
+      model: amd/Llama-3.1-405B-Instruct-MXFP4

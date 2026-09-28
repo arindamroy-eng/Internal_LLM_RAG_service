@@ -2,6 +2,7 @@
 
 import json
 import logging
+import time
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
@@ -94,6 +95,12 @@ async def _stream_response(
     yield f"data: {json.dumps({'type': 'meta', 'conversation_id': conversation_id})}\n\n"
 
     try:
+        # End-to-end TTFT, measured here rather than read off vLLM's own
+        # histogram: this span includes the LiteLLM hop and (once llm-d is in
+        # place) the endpoint-picker hop, which vLLM cannot see.
+        t0 = time.perf_counter()
+        ttft_logged = False
+
         stream = await llm_client.chat.completions.create(
             model=agent["model"],
             messages=messages,
@@ -104,6 +111,14 @@ async def _stream_response(
         async for chunk in stream:
             if chunk.choices and chunk.choices[0].delta.content:
                 token = chunk.choices[0].delta.content
+                if not ttft_logged:
+                    logger.info(
+                        "ttft_seconds=%.3f model=%s conversation_id=%s",
+                        time.perf_counter() - t0,
+                        agent["model"],
+                        conversation_id,
+                    )
+                    ttft_logged = True
                 full_response += token
                 yield f"data: {json.dumps({'type': 'token', 'content': token})}\n\n"
 
@@ -162,15 +177,31 @@ async def _persist_messages(
     """Save messages to DB and update Redis cache."""
     try:
         # Save to Postgres
-        await db.save_message(conversation_id, "user", user_message)
-        await db.save_message(conversation_id, "assistant", assistant_message)
+        user_row = await db.save_message(conversation_id, "user", user_message)
+        assistant_row = await db.save_message(
+            conversation_id, "assistant", assistant_message
+        )
 
-        # Update Redis cache
+        # Update Redis cache.
+        # `seq` must be carried into the cache entries: the context builder
+        # anchors its history window on it, and entries lacking a seq would be
+        # treated as unanchored and always included — so a cache hit and a
+        # cache miss would build different prompts for the same conversation.
         await message_cache.append_message(
-            conversation_id, {"role": "user", "content": user_message}
+            conversation_id,
+            {
+                "role": "user",
+                "content": user_message,
+                "seq": user_row.get("seq"),
+            },
         )
         await message_cache.append_message(
-            conversation_id, {"role": "assistant", "content": assistant_message}
+            conversation_id,
+            {
+                "role": "assistant",
+                "content": assistant_message,
+                "seq": assistant_row.get("seq"),
+            },
         )
     except Exception as e:
         logger.error(f"Failed to persist messages: {e}")

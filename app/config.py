@@ -44,7 +44,11 @@ class Settings(BaseSettings):
     redis_port: int = 6379
     redis_password: Optional[str] = None
     redis_message_ttl: int = 86400
-    redis_summary_ttl: int = 3600
+    # Must match redis_message_ttl. When the summary expired earlier than the
+    # messages it was derived from, the next turn regenerated DIFFERENT
+    # summary text and invalidated the prompt prefix from position two,
+    # discarding the whole conversation's prefix cache.
+    redis_summary_ttl: int = 86400
 
     @property
     def redis_url(self) -> str:
@@ -68,6 +72,14 @@ class Settings(BaseSettings):
     def litellm_base_url(self) -> str:
         return f"http://{self.litellm_host}:{self.litellm_port}/v1"
 
+    # ── LLM HTTP client tuning ──
+    # Retries live in LiteLLM (num_retries), not in the SDK — see
+    # app/services/llm_client.py for why stacking them is dangerous.
+    llm_request_timeout: float = 600.0
+    llm_connect_timeout: float = 5.0
+    llm_max_connections: int = 1000
+    llm_max_keepalive_connections: int = 200
+
     # ── Model Aliases ──
     chat_model_alias: str = "gpt-4"
     code_model_alias: str = "gpt-3.5-turbo"
@@ -78,6 +90,12 @@ class Settings(BaseSettings):
     reserved_response_tokens: int = 4096
     rag_chunk_token_budget: int = 3000
     summary_threshold_messages: int = 50
+    # History window eviction. The window is anchored and evicted in blocks so
+    # the prompt prefix stays byte-identical across consecutive turns; see
+    # ContextManager._select_history_window. Larger blocks trade context
+    # density for prefix stability (and therefore prefix-cache hit rate).
+    history_evict_block_messages: int = 8
+    history_evict_target_ratio: float = 0.85
 
     # ── Document Ingestion ──
     chunk_size: int = 512

@@ -168,7 +168,7 @@ class Database:
         row = await self.pool.fetchrow(
             """INSERT INTO messages (conversation_id, role, content, token_count, metadata)
                VALUES ($1::uuid, $2, $3, $4, $5::jsonb)
-               RETURNING id, conversation_id, role, content, token_count, metadata, created_at""",
+               RETURNING id, conversation_id, role, content, token_count, metadata, created_at, seq""",
             conversation_id, role, content, token_count, metadata
         )
         # Update conversation timestamp
@@ -178,13 +178,30 @@ class Database:
         )
         return dict(row)
 
-    async def get_messages(self, conversation_id: str, limit: int = 200) -> list[dict]:
+    async def get_messages(self, conversation_id: str, limit: int = 100) -> list[dict]:
+        """
+        Return the NEWEST `limit` messages, in chronological order.
+
+        This previously did `ORDER BY created_at ASC LIMIT $2`, which returns
+        the OLDEST messages. For any conversation longer than the limit, a
+        Redis cache miss — which happens on TTL expiry or a Redis restart —
+        silently rewound the model to the beginning of the conversation.
+
+        The default matches MessageCache.max so the cache-hit and cache-miss
+        paths produce the same list; if they diverge, the prompt prefix
+        changes depending on cache state and prefix-cache hit rates become
+        unreproducible.
+        """
         rows = await self.pool.fetch(
-            """SELECT id, role, content, token_count, metadata, created_at
-               FROM messages
-               WHERE conversation_id = $1::uuid
-               ORDER BY created_at ASC
-               LIMIT $2""",
+            """SELECT id, role, content, token_count, metadata, created_at, seq
+               FROM (
+                   SELECT id, role, content, token_count, metadata, created_at, seq
+                   FROM messages
+                   WHERE conversation_id = $1::uuid
+                   ORDER BY seq DESC
+                   LIMIT $2
+               ) recent
+               ORDER BY seq ASC""",
             conversation_id, limit
         )
         return [dict(r) for r in rows]

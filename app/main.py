@@ -153,13 +153,19 @@ async def health_check():
         status = "degraded"
 
     # LiteLLM
+    # Use /health/liveliness, not /health: the latter requires the master key
+    # and returns 401 unauthenticated, so this probe could never report ok.
     try:
         async with httpx.AsyncClient() as client:
             resp = await client.get(
-                f"http://{settings.litellm_host}:{settings.litellm_port}/health",
+                f"http://{settings.litellm_host}:{settings.litellm_port}/health/liveliness",
                 timeout=5.0,
             )
-            checks["litellm"] = "ok" if resp.status_code == 200 else f"status {resp.status_code}"
+            if resp.status_code == 200:
+                checks["litellm"] = "ok"
+            else:
+                checks["litellm"] = f"status {resp.status_code}"
+                status = "degraded"
     except Exception as e:
         checks["litellm"] = f"error: {e}"
         status = "degraded"
