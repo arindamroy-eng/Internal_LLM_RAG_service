@@ -81,9 +81,34 @@ class Settings(BaseSettings):
     llm_max_keepalive_connections: int = 200
 
     # ── Model Aliases ──
+    # These are OpenAI-shaped names for SELF-HOSTED models; no OpenAI model is
+    # ever called. The alias tells you nothing about the backend:
+    #   gpt-4 / gpt-4-turbo / gpt-4o -> Llama 3.1 405B Instruct (MXFP4)
+    #   gpt-3.5-turbo                -> Qwen 2.5 Coder 32B  (a CODE model)
+    #   text-embedding-*             -> BGE-large-en-v1.5
     chat_model_alias: str = "gpt-4"
     code_model_alias: str = "gpt-3.5-turbo"
     embed_model_alias: str = "text-embedding-ada-002"
+
+    # Chat-capable aliases beyond chat_model_alias and code_model_alias.
+    # Embedding aliases are deliberately excluded — an agent cannot converse
+    # with an embedding model.
+    #
+    # MUST stay in sync with the model_list in litellm_config.yaml. A value
+    # accepted here but absent there is accepted at agent-creation time and
+    # then fails as a 502 on the user's first chat.
+    extra_agent_model_aliases: str = "gpt-4-turbo,gpt-4o"
+
+    @property
+    def allowed_agent_models(self) -> tuple[str, ...]:
+        """Aliases accepted for `agents.model`, in display order."""
+        extras = [
+            a.strip() for a in self.extra_agent_model_aliases.split(",") if a.strip()
+        ]
+        # dict.fromkeys dedupes while preserving order.
+        return tuple(
+            dict.fromkeys([self.chat_model_alias, self.code_model_alias, *extras])
+        )
 
     # ── Context Management ──
     default_max_context_tokens: int = 16384

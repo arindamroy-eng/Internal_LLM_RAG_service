@@ -138,6 +138,26 @@ curl -X POST http://localhost:8080/api/v1/agents/{agent_id}/chat \
 
 ### Creating an Agent
 
+> **The model names are aliases for self-hosted models — no OpenAI model is
+> ever called.** They keep the OpenAI SDKs working as a drop-in, but the name
+> tells you nothing about what actually serves the request:
+
+| Alias you request | What actually serves it | GPUs |
+|---|---|---|
+| `gpt-4`, `gpt-4-turbo`, `gpt-4o` | Llama 3.1 405B Instruct (MXFP4) | 0–5 |
+| `gpt-3.5-turbo` | **Qwen 2.5 Coder 32B** — a *code* model, despite the name | 6 |
+| `text-embedding-ada-002`, `text-embedding-3-small` | BGE-large-en-v1.5 | 7 |
+
+> Pick the alias by the **backend you want**, not by what the name suggests.
+> An agent doing code generation should set `"model": "gpt-3.5-turbo"` even
+> though that name reads like a downgrade.
+>
+> Unknown aliases are rejected at agent-creation time with a `422` listing the
+> valid options. The accepted set is derived from `CHAT_MODEL_ALIAS`,
+> `CODE_MODEL_ALIAS` and `EXTRA_AGENT_MODEL_ALIASES`, and **must be kept in
+> sync with the `model_list` in `litellm_config.yaml`** — a name accepted here
+> but absent there would still fail later as a 502.
+
 ```python
 from openai import OpenAI
 
@@ -151,7 +171,7 @@ headers = {"Authorization": "Bearer sk-alice-key"}
 agent = requests.post(f"{API_BASE}/agents", headers=headers, json={
     "name": "Research Assistant",
     "system_prompt": "You are a helpful research assistant...",
-    "model": "gpt-4",
+    "model": "gpt-4",          # alias -> Llama 3.1 405B (see table above)
     "temperature": 0.7,
     "enable_rag": True
 }).json()
@@ -182,10 +202,18 @@ client = OpenAI(
     api_key="sk-alice-litellm-key"
 )
 
-# This hits the 405B model on GPUs 0-5
+# "gpt-4" resolves to Llama 3.1 405B. With the sharded layout this is a
+# POOL of three TP=2 replicas on GPUs 0-5, not a single server — LiteLLM
+# (or llm-d, if enabled) picks which replica serves the request.
 response = client.chat.completions.create(
     model="gpt-4",
     messages=[{"role": "user", "content": "Explain quantum entanglement"}]
+)
+
+# Code generation goes to Qwen 2.5 Coder, addressed as "gpt-3.5-turbo".
+response = client.chat.completions.create(
+    model="gpt-3.5-turbo",
+    messages=[{"role": "user", "content": "Write a binary search in Rust"}]
 )
 ```
 
