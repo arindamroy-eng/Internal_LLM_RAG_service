@@ -72,7 +72,9 @@ class Database:
             user_id,
             data["name"],
             data["system_prompt"],
-            data.get("model", "gpt-4"),
+            # Default sourced from config rather than hardcoded, so changing
+            # CHAT_MODEL_ALIAS does not silently leave this layer behind.
+            data.get("model") or settings.chat_model_alias,
             data.get("temperature", 0.7),
             data.get("tools", "[]"),
             data.get("rag_collection"),
